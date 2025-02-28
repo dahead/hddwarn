@@ -1,0 +1,11 @@
+[package]
+name = "hddwarn"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sysinfo = "0.29"
+lettre = "0.10"
+hostname = "0.3.1"
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0.139"
