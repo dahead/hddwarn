@@ -1,6 +1,4 @@
-use std::{env, process};
-use std::fs::File;
-use std::io::{self};
+use std::{env, fs::{File}, io::{self, Write}, process};
 use std::io::{BufReader};
 use std::path::Path;
 use sysinfo::{System, SystemExt, DiskExt};
@@ -15,6 +13,7 @@ struct Config {
     port: u16,
     sendmail: String,
     password: String,
+    recipient: String,
 }
 
 struct DiskInfo {
@@ -42,7 +41,7 @@ fn format_mail_content(server_name: &str, disks: &[DiskInfo]) -> String {
     let mut output = format!("Servername: {}\n", server_name);
     for disk in disks {
         if disk.free_space <= 10 {
-            output.push_str(&format!("WARNING! DISK {} has {} GB left free space.\n", disk.name, disk.free_space));
+            output.push_str(&format!("DISK {} has {} GB left free space. WARNING!\n", disk.name, disk.free_space));
         } else {
             output.push_str(&format!("DISK {} has {} GB left free space.\n", disk.name, disk.free_space));
         }
@@ -56,6 +55,7 @@ fn create_default_config() -> io::Result<()> {
         port: 587,
         sendmail: "youremail@example.com".to_string(),
         password: "yourpassword".to_string(),
+        recipient: "john.doe@example.com".to_string(),
     };
 
     let config_path = Path::new("config.json");
@@ -96,13 +96,124 @@ fn send_mail(mailserver: &str, port: u16, sendmail: &str, password: &str, recipi
     }
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <recipient_email>", args[0]);
-        process::exit(1);
+// Function to create the autostart registry file
+fn create_autostart_helper_files() -> io::Result<()> {
+    // Get the path to the current executable
+    let executable_path = env::current_exe().unwrap();
+    let executable_path_str = executable_path.to_string_lossy().to_string();
+
+    // Create the .reg file content
+    let reg_content = format!(
+        r#"
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run]
+"hddwarn"="{}"
+"#,
+        executable_path_str
+    );
+
+    // Path where the .reg file will be saved
+    let reg_file_path = Path::new("autostart.reg");
+
+    // Create or open the .reg file and write the content
+    let mut reg_file = File::create(reg_file_path)?;
+    reg_file.write_all(reg_content.as_bytes())?;
+    println!("Auto-start registry file created at autostart.reg");
+
+    Ok(())
+}
+
+// Function to create a task scheduler entry
+fn create_task_scheduler_entries() -> io::Result<()> {
+    // Get the path to the current executable
+    let executable_path = env::current_exe().unwrap();
+    let executable_path_str = executable_path.to_string_lossy().to_string();
+
+    // XML content for creating a Task Scheduler entry that runs every 24 hours
+    let task_xml = format!(
+        r#"
+<?xml version="1.0" encoding="UTF-8"?>
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>hddwarn</Author>
+    <Description>Runs hddwarn every 24 hours</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2025-02-28T12:00:00</StartBoundary>
+      <Repetition>
+        <Interval>P1D</Interval>
+        <Duration>P1D</Duration>
+      </Repetition>
+    </CalendarTrigger>
+  </Triggers>
+  <Actions>
+    <Exec>
+      <Command>{}</Command>
+    </Exec>
+  </Actions>
+</Task>
+"#,
+        executable_path_str
+    );
+
+    // Path where the XML task file will be saved
+    let task_file_path = Path::new("task_scheduler.xml");
+
+    // Create or open the XML file and write the content
+    let mut task_file = File::create(task_file_path)?;
+    task_file.write_all(task_xml.as_bytes())?;
+    println!("Task Scheduler entry XML created at task_scheduler.xml");
+
+    // Register the task using schtasks command
+    let schtasks_command = format!(
+        "schtasks /create /tn \"hddwarn Task\" /xml \"{}\" /f",
+        task_file_path.display()
+    );
+
+    // Execute the command to register the task
+    let output = process::Command::new("cmd")
+        .arg("/C")
+        .arg(schtasks_command)
+        .output()
+        .expect("Failed to execute schtasks command");
+
+    if !output.status.success() {
+        eprintln!("Failed to register the task scheduler entry.");
+        return Err(io::Error::new(io::ErrorKind::Other, "Failed to register the task"));
     }
-    let recipient = &args[1];
+
+    println!("Task scheduler entry successfully created.");
+    Ok(())
+}
+
+fn main() {
+
+    // Special parameters?
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() >= 2 {
+
+        // remember parameter 1
+        let param1 = &args[1];
+
+        // Check if the first parameter is "create_autostart_helper_files".
+        // That creates a Windows registry file that adds this app to autostart if imported via double click.
+        if param1 == "create_autostart_helper_files" {
+            if let Err(e) = create_autostart_helper_files() {
+                eprintln!("Failed to create auto-start helper files: {}", e);
+            }
+            return;
+        }
+
+        // Check if the first parameter is "create_task_scheduler_entries".
+        // This creates an entry in the Task Scheduler so that the app runs every 24h.
+        if param1 == "create_task_scheduler_entries" {
+            if let Err(e) = create_task_scheduler_entries() {
+                eprintln!("Failed to create task-start scheduler entries: {}", e);
+            }
+            return;
+        }
+    }
 
     // Check for config.json
     let config = if let Some(config) = read_config() {
@@ -115,22 +226,25 @@ fn main() {
         std::process::exit(1);
     };
 
+    // get hostname for the report
     let hostname_str = hostname::get()
         .map(|hostname| hostname.to_string_lossy().into_owned())
         .unwrap_or_else(|_| String::from("Unknown"));
 
+    // collect report data
     let disks = get_disk_info();
     let mail_content = format_mail_content(&hostname_str, &disks);
 
     // Print the mail content to the CLI
     println!("\n--- Mail Content ---\n{}", mail_content);
 
+    // Send report via mail
     send_mail(
         &config.mailserver,
         config.port,
         &config.sendmail,
         &config.password,
-        recipient,
+        &config.recipient,
         "Disk Space Report",
         &mail_content,
     );
